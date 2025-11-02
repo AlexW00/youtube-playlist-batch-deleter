@@ -29,4 +29,4 @@ You can unlock the headers at any time with the **Edit token** button to paste n
 
 ## Deployment
 
-Pushes to `main` automatically build and publish the site to GitHub Pages at <https://alexw00.github.io/youtube-playlist-bach-deleter/>.
+Pushes to `main` automatically build and publish the site to GitHub Pages at <https://alexw00.github.io/youtube-playlist-batch-deleter/>.

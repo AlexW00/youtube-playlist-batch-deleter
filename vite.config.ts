@@ -6,7 +6,7 @@ import { fileURLToPath } from "url"
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEPLOY_BASE_PATH =
   process.env.GITHUB_PAGES === "true"
-    ? "/youtube-playlist-bach-deleter/"
+    ? "/youtube-playlist-batch-deleter/"
     : "/"
 
 // https://vite.dev/config/
