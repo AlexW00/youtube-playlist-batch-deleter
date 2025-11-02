@@ -1,17 +1,10 @@
-const DEV_DATA_API_BASE = "/yt-api/youtube/v3"
 const DEV_INNERTUBE_BASE = "/yt-inner/youtubei/v1"
-const PROD_DATA_API_BASE = "https://www.googleapis.com/youtube/v3"
 const PROD_INNERTUBE_BASE = "https://www.youtube.com/youtubei/v1"
 
 const DEFAULT_CLIENT_VERSION = "2.20251030.01.00"
 const DEFAULT_CLIENT_NAME_CODE = "1" // WEB
 const DEFAULT_ORIGIN = "https://www.youtube.com"
 const PLAYLIST_BROWSE_ID = "FEplaylist_aggregation"
-
-const DATA_API_BASE = normalizeBaseUrl(
-  import.meta.env.VITE_YOUTUBE_API_BASE ??
-    (import.meta.env.DEV ? DEV_DATA_API_BASE : PROD_DATA_API_BASE),
-)
 
 const INNERTUBE_BASE = normalizeBaseUrl(
   import.meta.env.VITE_YOUTUBEI_API_BASE ??
@@ -24,29 +17,8 @@ export interface Playlist {
   description: string
   privacyStatus: string
   itemCount: number
-  channelTitle: string
   updatedAt: string
   thumbnailUrl?: string
-}
-
-interface PlaylistApiResponse {
-  nextPageToken?: string
-  items?: Array<{
-    id: string
-    snippet?: {
-      title?: string
-      description?: string
-      channelTitle?: string
-      thumbnails?: Record<string, { url?: string }>
-      publishedAt?: string
-    }
-    status?: {
-      privacyStatus?: string
-    }
-    contentDetails?: {
-      itemCount?: number
-    }
-  }>
 }
 
 interface GoogleApiError {
@@ -81,6 +53,7 @@ const DEFAULT_HEADERS: HeaderMap = {
   Origin: DEFAULT_ORIGIN,
   "X-Youtube-Client-Name": DEFAULT_CLIENT_NAME_CODE,
   "X-Youtube-Client-Version": DEFAULT_CLIENT_VERSION,
+  "X-Youtube-Bootstrap-Logged-In": "true",
 }
 
 const PROXY_HEADER_MAP: Record<string, string> = {
@@ -123,6 +96,8 @@ const CLIENT_NAME_BY_CODE: Record<string, string> = {
   "67": "WEB_REMIX",
 }
 
+const SAPISID_AUTH_REGEX = /SAPISIDHASH\s+\S+/i
+
 export function normalizeHeaderName(name: string): string {
   return name
     .trim()
@@ -137,22 +112,7 @@ export async function fetchAllPlaylists(
   signal?: AbortSignal,
 ): Promise<Playlist[]> {
   const prepared = prepareHeaders(rawHeaders)
-  if (shouldUseInnerTube(prepared.normalized)) {
-    return fetchPlaylistsInnerTube(prepared, signal)
-  }
-
-  try {
-    return await fetchPlaylistsDataApi(prepared, signal)
-  } catch (error) {
-    // Fall back to InnerTube when official API rejects the credentials
-    if (
-      error instanceof YouTubeApiError &&
-      (error.status === 401 || error.status === 403)
-    ) {
-      return fetchPlaylistsInnerTube(prepared, signal)
-    }
-    throw error
-  }
+  return fetchPlaylistsInnerTube(prepared, signal)
 }
 
 export async function deletePlaylist(
@@ -161,31 +121,7 @@ export async function deletePlaylist(
   signal?: AbortSignal,
 ): Promise<void> {
   const prepared = prepareHeaders(rawHeaders)
-  if (shouldUseInnerTube(prepared.normalized)) {
-    await deletePlaylistInnerTube(playlistId, prepared, signal)
-    return
-  }
-
-  try {
-    await deletePlaylistDataApi(playlistId, prepared, signal)
-  } catch (error) {
-    if (
-      error instanceof YouTubeApiError &&
-      (error.status === 401 || error.status === 403)
-    ) {
-      await deletePlaylistInnerTube(playlistId, prepared, signal)
-      return
-    }
-    throw error
-  }
-}
-
-function shouldUseInnerTube(headers: HeaderMap): boolean {
-  const auth = headers.Authorization ?? ""
-  if (/^Bearer\s+/i.test(auth)) {
-    return false
-  }
-  return /SAPISID/i.test(auth)
+  await deletePlaylistInnerTube(playlistId, prepared, signal)
 }
 
 function prepareHeaders(raw: HeaderMap): PreparedHeaders {
@@ -197,6 +133,21 @@ function prepareHeaders(raw: HeaderMap): PreparedHeaders {
   if (!normalized.Authorization?.trim()) {
     throw new Error("Authorization header is required.")
   }
+
+  const authorizationValue = normalized.Authorization.trim()
+  normalized.Authorization = authorizationValue
+
+  if (!SAPISID_AUTH_REGEX.test(authorizationValue)) {
+    throw new Error(
+      "Authorization header must include a SAPISIDHASH token from an authenticated YouTube request.",
+    )
+  }
+
+  const cookieValue = normalized.Cookie?.trim()
+  if (!cookieValue) {
+    throw new Error("Cookie header is required for SAPISID authentication.")
+  }
+  normalized.Cookie = cookieValue
 
   const headers = new Headers()
   for (const [key, value] of Object.entries(normalized)) {
@@ -254,69 +205,6 @@ async function handleResponse(response: Response): Promise<any> {
   }
 
   return body
-}
-
-async function fetchPlaylistsDataApi(
-  prepared: PreparedHeaders,
-  signal?: AbortSignal,
-): Promise<Playlist[]> {
-  const playlists: Playlist[] = []
-  let pageToken: string | undefined
-
-  do {
-    const url = buildEndpoint(DATA_API_BASE, "playlists", {
-      part: "snippet,contentDetails,status",
-      mine: "true",
-      maxResults: "50",
-      ...(pageToken ? { pageToken } : {}),
-    })
-
-    const requestHeaders = new Headers(prepared.headers)
-
-    const data = (await fetch(url, {
-      method: "GET",
-      headers: requestHeaders,
-      signal,
-      credentials: "include",
-    }).then(handleResponse)) as PlaylistApiResponse
-
-    for (const item of data.items ?? []) {
-      playlists.push({
-        id: item.id,
-        title: item.snippet?.title ?? "Untitled playlist",
-        description: item.snippet?.description ?? "",
-        channelTitle: item.snippet?.channelTitle ?? "",
-        privacyStatus: item.status?.privacyStatus ?? "unknown",
-        itemCount: item.contentDetails?.itemCount ?? 0,
-        updatedAt: item.snippet?.publishedAt ?? "",
-        thumbnailUrl:
-          item.snippet?.thumbnails?.standard?.url ??
-          item.snippet?.thumbnails?.high?.url ??
-          item.snippet?.thumbnails?.medium?.url ??
-          item.snippet?.thumbnails?.default?.url,
-      })
-    }
-
-    pageToken = data.nextPageToken
-  } while (pageToken)
-
-  return playlists
-}
-
-async function deletePlaylistDataApi(
-  playlistId: string,
-  prepared: PreparedHeaders,
-  signal?: AbortSignal,
-): Promise<void> {
-  const url = buildEndpoint(DATA_API_BASE, "playlists", { id: playlistId })
-  const requestHeaders = new Headers(prepared.headers)
-
-  await fetch(url, {
-    method: "DELETE",
-    headers: requestHeaders,
-    signal,
-    credentials: "include",
-  }).then(handleResponse)
 }
 
 async function fetchPlaylistsInnerTube(
@@ -573,11 +461,6 @@ function convertRendererToPlaylist(renderer: any): Playlist | null {
     getText(renderer?.descriptionSnippet) ??
     getText(renderer?.description) ??
     ""
-  const channelTitle =
-    getText(renderer?.shortBylineText) ??
-    getText(renderer?.longBylineText) ??
-    "Unknown channel"
-
   const countText =
     getText(renderer?.videoCountShortText) ??
     getText(renderer?.videoCountText) ??
@@ -604,7 +487,6 @@ function convertRendererToPlaylist(renderer: any): Playlist | null {
     id: playlistId,
     title,
     description,
-    channelTitle,
     privacyStatus:
       renderer?.privacyStatus ??
       (renderer?.isEditable ? "private" : "unknown"),
@@ -710,11 +592,6 @@ function convertLockupPlaylist(renderer: any): Playlist | null {
     /\b(updated|aktualisiert)\b/i.test(row),
   )
 
-  const channelTitle =
-    flattenedRows.find((row) =>
-      /\bkanal\b|\bchannel\b/i.test(row),
-    ) ?? "Unknown channel"
-
   const overlays =
     lockup.contentImage?.collectionThumbnailViewModel?.primaryThumbnail
       ?.thumbnailViewModel?.overlays ?? []
@@ -743,7 +620,6 @@ function convertLockupPlaylist(renderer: any): Playlist | null {
     id: playlistId,
     title,
     description,
-    channelTitle,
     privacyStatus,
     itemCount: Number.isFinite(itemCount) ? Number(itemCount) : 0,
     updatedAt: updatedRow ?? "",

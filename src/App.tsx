@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react"
-import { AlertCircle, RefreshCw, Trash2 } from "lucide-react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, RefreshCw, Trash2 } from "lucide-react"
 import { Toaster, toast } from "sonner"
 
 import {
@@ -22,6 +22,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
+import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
   Table,
@@ -42,6 +43,9 @@ import {
 } from "@/lib/youtube"
 
 const HEADERS_STORAGE_KEY = "youtube-playlist-organizer:headers"
+const SAPISID_TOKEN_REGEX = /SAPISIDHASH\s+\S+/i
+const REQUEST_LINE_REGEX =
+  /^(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\s+\S+\s+HTTP\/\d+(?:\.\d+)?$/i
 
 interface ParsedHeadersResult {
   headers: HeaderMap
@@ -61,6 +65,9 @@ function parseHeaders(text: string): ParsedHeadersResult {
 
     const separatorIndex = trimmed.indexOf(":")
     if (separatorIndex === -1) {
+      if (REQUEST_LINE_REGEX.test(trimmed)) {
+        return
+      }
       errors.push(`Line ${index + 1}: Missing ":" separator.`)
       return
     }
@@ -99,6 +106,10 @@ function App() {
   const [headersText, setHeadersText] = useState("")
   const [playlists, setPlaylists] = useState<Playlist[]>([])
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [searchQuery, setSearchQuery] = useState("")
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc" | null>(null)
+  const [headersLocked, setHeadersLocked] = useState(false)
+  const [lastAutoAttemptKey, setLastAutoAttemptKey] = useState<string | null>(null)
   const [isFetching, setIsFetching] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
   const [fetchError, setFetchError] = useState<string | null>(null)
@@ -112,6 +123,12 @@ function App() {
   const fetchAbortRef = useRef<AbortController | null>(null)
   const deleteAbortRef = useRef<AbortController | null>(null)
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
+
+  useEffect(() => {
+    if (typeof document !== "undefined") {
+      document.title = "YouTube Playlist Batch Deleter"
+    }
+  }, [])
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -145,44 +162,128 @@ function App() {
   )
 
   const authHeader = headers["Authorization"] ?? ""
-  const usingOfficialApi = /^Bearer\s+/i.test(authHeader)
-  const usingInnerTube = !usingOfficialApi && Boolean(authHeader)
+  const cookieHeader = headers["Cookie"] ?? ""
+  const visitorHeader = headers["X-Goog-Visitor-Id"] ?? ""
+  const hasSapAuth = SAPISID_TOKEN_REGEX.test(authHeader)
+  const usingInnerTube = hasSapAuth
+
+  const filteredPlaylists = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase()
+    if (query.length === 0) {
+      return playlists
+    }
+
+    return playlists.filter((playlist) =>
+      playlist.title.toLowerCase().includes(query),
+    )
+  }, [playlists, searchQuery])
+
+  const processedPlaylists = useMemo(() => {
+    if (!sortDirection) {
+      return filteredPlaylists
+    }
+
+    const sorted = [...filteredPlaylists].sort((a, b) => {
+      const comparison = a.title.localeCompare(b.title, undefined, {
+        sensitivity: "base",
+      })
+      return sortDirection === "asc" ? comparison : -comparison
+    })
+    return sorted
+  }, [filteredPlaylists, sortDirection])
+
+  const normalizedSearch = searchQuery.trim()
+  const hasSearch = normalizedSearch.length > 0
 
   const selectedCount = selectedIds.size
-  const allSelected = playlists.length > 0 && selectedCount === playlists.length
+  const someVisibleSelected = processedPlaylists.some((playlist) =>
+    selectedIds.has(playlist.id),
+  )
+  const allVisibleSelected =
+    processedPlaylists.length > 0 &&
+    processedPlaylists.every((playlist) => selectedIds.has(playlist.id))
+  const selectAllState: boolean | "indeterminate" = allVisibleSelected
+    ? true
+    : someVisibleSelected
+      ? "indeterminate"
+      : false
 
   const missingRequiredHeaders: string[] = []
   if (!authHeader) {
-    missingRequiredHeaders.push("Authorization")
+    missingRequiredHeaders.push("Authorization (SAPISIDHASH token)")
   }
-  if (usingInnerTube && !headers["Cookie"]) {
+  if (hasSapAuth && !cookieHeader) {
     missingRequiredHeaders.push("Cookie")
   }
 
   const advisoryHeaders: string[] = []
-  if (usingInnerTube && !headers["X-Goog-Visitor-Id"]) {
+  if (usingInnerTube && !visitorHeader) {
     advisoryHeaders.push("X-Goog-Visitor-Id")
   }
   if (usingInnerTube && !headers["X-Youtube-Client-Version"]) {
     advisoryHeaders.push("X-Youtube-Client-Version")
   }
 
-  const authTypeLabel = usingOfficialApi
-    ? "Bearer token (official API)"
-    : usingInnerTube
-      ? "SAPISIDHASH (youtubei)"
-      : "Not detected"
+  const validationErrors: string[] = []
+  if (authHeader && !hasSapAuth) {
+    validationErrors.push(
+      "Authorization header must include a SAPISIDHASH token copied from an authenticated youtube.com request.",
+    )
+  }
+
+  const authTypeLabel = hasSapAuth
+    ? "SAPISIDHASH token detected"
+    : authHeader
+      ? "Authorization header invalid"
+      : "Awaiting authorization header"
+
+  const headerErrorsKey = headerErrors.join("|")
+  const missingRequiredKey = missingRequiredHeaders.join("|")
+  const validationErrorsKey = validationErrors.join("|")
+
+  const autoFetchKey = useMemo(() => {
+    if (!hasSapAuth) {
+      return null
+    }
+    if (headerErrors.length > 0) {
+      return null
+    }
+    if (validationErrors.length > 0) {
+      return null
+    }
+    if (missingRequiredHeaders.length > 0) {
+      return null
+    }
+
+    return [
+      authHeader.trim(),
+      cookieHeader.trim(),
+      visitorHeader.trim(),
+    ].join("|")
+  }, [
+    authHeader,
+    cookieHeader,
+    hasSapAuth,
+    headerErrorsKey,
+    missingRequiredKey,
+    validationErrorsKey,
+    visitorHeader,
+  ])
 
   const toggleSelectAll = () => {
-    if (playlists.length === 0) {
+    if (processedPlaylists.length === 0) {
       return
     }
 
-    if (allSelected) {
-      setSelectedIds(new Set())
-    } else {
-      setSelectedIds(new Set(playlists.map((playlist) => playlist.id)))
-    }
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (allVisibleSelected) {
+        processedPlaylists.forEach((playlist) => next.delete(playlist.id))
+      } else {
+        processedPlaylists.forEach((playlist) => next.add(playlist.id))
+      }
+      return next
+    })
   }
 
   const toggleSelect = (id: string) => {
@@ -197,57 +298,128 @@ function App() {
     })
   }
 
-  const handleFetchPlaylists = async () => {
-    setFetchError(null)
-
-    if (headerErrors.length > 0) {
-      setFetchError("Fix header formatting errors before fetching.")
-      return
-    }
-    if (missingRequiredHeaders.length > 0) {
-      setFetchError(
-        `Add required header${missingRequiredHeaders.length > 1 ? "s" : ""}: ${missingRequiredHeaders.join(", ")}`,
-      )
-      return
-    }
-
-    fetchAbortRef.current?.abort()
-    const controller = new AbortController()
-    fetchAbortRef.current = controller
-
-    setIsFetching(true)
-    try {
-      const result = await fetchAllPlaylists(headers, controller.signal)
-      setPlaylists(result)
-      setSelectedIds(new Set())
-
-      if (result.length === 0) {
-        toast.info("No playlists found on this account.")
-      } else {
-        toast.success(`Loaded ${result.length} playlist(s).`)
+  const handleToggleSort = () => {
+    setSortDirection((previous) => {
+      if (previous === "asc") {
+        return "desc"
       }
-    } catch (error) {
-      if ((error as Error).name === "AbortError") {
-        return
+      if (previous === "desc") {
+        return null
       }
-
-      if (error instanceof YouTubeApiError) {
-        let message = `YouTube API error (${error.status}): ${error.message || "Unknown error"}`
-        if (usingInnerTube && (error.status === 401 || error.status === 403)) {
-          message +=
-            " • Double-check that your Cookie header is included and matches the SAPISIDHASH value."
-        }
-        setFetchError(message)
-      } else if (error instanceof Error) {
-        setFetchError(error.message)
-      } else {
-        setFetchError("Unknown error while fetching playlists.")
-      }
-    } finally {
-      setIsFetching(false)
-      fetchAbortRef.current = null
-    }
+      return "asc"
+    })
   }
+
+  const handleUnlockHeaders = () => {
+    setHeadersLocked(false)
+    setPlaylists([])
+    setSelectedIds(new Set())
+    setFetchError(null)
+    setDeleteError(null)
+    setLastAutoAttemptKey(autoFetchKey)
+  }
+
+  const handleFetchPlaylists = useCallback(async () => {
+      setFetchError(null)
+
+      if (headerErrors.length > 0) {
+        setFetchError("Fix header formatting errors before fetching.")
+        return false
+      }
+      if (!hasSapAuth) {
+        setFetchError(
+          "Authorization header must include a SAPISIDHASH token from youtube.com.",
+        )
+        return false
+      }
+      if (missingRequiredHeaders.length > 0) {
+        setFetchError(
+          `Add required header${missingRequiredHeaders.length > 1 ? "s" : ""}: ${missingRequiredHeaders.join(", ")}`,
+        )
+        return false
+      }
+      if (validationErrors.length > 0) {
+        setFetchError(validationErrors[0])
+        return false
+      }
+
+      fetchAbortRef.current?.abort()
+      const controller = new AbortController()
+      fetchAbortRef.current = controller
+
+      setIsFetching(true)
+      try {
+        const result = await fetchAllPlaylists(headers, controller.signal)
+        setPlaylists(result)
+        setSelectedIds(new Set())
+        setHeadersLocked(true)
+
+        if (result.length === 0) {
+          toast.info("No playlists found on this account.")
+        } else {
+          toast.success(`Loaded ${result.length} playlist(s).`)
+        }
+
+        return true
+      } catch (error) {
+        if ((error as Error).name === "AbortError") {
+          return false
+        }
+
+        if (error instanceof YouTubeApiError) {
+          let message = `YouTube API error (${error.status}): ${error.message || "Unknown error"}`
+          if (usingInnerTube && (error.status === 401 || error.status === 403)) {
+            message +=
+              " • Make sure your Cookie header was captured alongside the SAPISIDHASH token."
+          }
+          setFetchError(message)
+        } else if (error instanceof Error) {
+          setFetchError(error.message)
+        } else {
+          setFetchError("Unknown error while fetching playlists.")
+        }
+
+        return false
+      } finally {
+        setIsFetching(false)
+        fetchAbortRef.current = null
+      }
+    },
+    [
+      headerErrors,
+      hasSapAuth,
+      headers,
+      missingRequiredHeaders,
+      setHeadersLocked,
+      validationErrors,
+      usingInnerTube,
+    ],
+  )
+
+  useEffect(() => {
+    if (!autoFetchKey) {
+      return
+    }
+    if (headersLocked) {
+      return
+    }
+    if (autoFetchKey === lastAutoAttemptKey) {
+      return
+    }
+    if (isFetching || isDeleting) {
+      return
+    }
+
+    setLastAutoAttemptKey(autoFetchKey)
+    void handleFetchPlaylists()
+  }, [
+    autoFetchKey,
+    handleFetchPlaylists,
+    headersLocked,
+    isDeleting,
+    isFetching,
+    lastAutoAttemptKey,
+  ])
 
   const handleDeletePlaylists = async () => {
     setDeleteError(null)
@@ -327,6 +499,7 @@ function App() {
   const isActionDisabled =
     headerErrors.length > 0 ||
     missingRequiredHeaders.length > 0 ||
+    validationErrors.length > 0 ||
     isFetching ||
     isDeleting
 
@@ -336,41 +509,33 @@ function App() {
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-6 py-10">
         <header className="space-y-2">
           <h1 className="text-3xl font-semibold leading-tight sm:text-4xl">
-            YouTube Playlist Organizer
+            YouTube Playlist Batch Deleter
           </h1>
           <p className="text-sm text-muted-foreground sm:text-base">
-            Paste the authentication headers captured from an authenticated
-            YouTube request. We never send this data anywhere except directly to
-            YouTube.
+            Paste the exact headers from a logged-in youtube.com request that
+            includes a SAPISIDHASH Authorization token. We only forward them
+            directly to YouTube.
           </p>
         </header>
 
         <Card>
-          <CardHeader>
+          <CardHeader className="space-y-2">
             <CardTitle>Authentication Headers</CardTitle>
-            <CardDescription>
-              Required headers are documented in{" "}
-              <a
-                className="underline underline-offset-4"
-                href="https://ytmusicapi.readthedocs.io/en/stable/setup/browser.html#copy-authentication-headers"
-                target="_blank"
-                rel="noreferrer"
-              >
-                the YT Music guide
-              </a>
-              . Include at least an{" "}
-              <span className="font-semibold">Authorization</span> header. A{" "}
-              <code className="rounded bg-muted px-1 py-0.5 text-xs">Bearer …</code>{" "}
-              token uses the official Data API. An{" "}
-              <code className="rounded bg-muted px-1 py-0.5 text-xs">
-                SAPISIDHASH …
-              </code>{" "}
-              token switches to the internal <code>youtubei</code> endpoints and
-              also needs matching{" "}
-              <span className="font-semibold">Cookie</span> and{" "}
-              <span className="font-semibold">X-Goog-Visitor-Id</span> headers
-              from the same request.
-            </CardDescription>
+            {!headersLocked && (
+              <CardDescription>
+                Paste the raw headers from an authenticated request to{" "}
+                <code className="rounded bg-muted px-1 py-0.5 text-xs">
+                  https://www.youtube.com
+                </code>
+                . The Authorization line must contain{" "}
+                <code className="rounded bg-muted px-1 py-0.5 text-xs">
+                  SAPISIDHASH …
+                </code>{" "}
+                and you need the matching <span className="font-semibold">Cookie</span>{" "}
+                and <span className="font-semibold">X-Goog-Visitor-Id</span> values
+                from the same request.
+              </CardDescription>
+            )}
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2">
@@ -382,10 +547,16 @@ function App() {
                 value={headersText}
                 onChange={(event) => setHeadersText(event.target.value)}
                 placeholder={
-                  "Authorization: Bearer ya29... \nX-Goog-AuthUser: 0\nX-Origin: https://www.youtube.com\nCookie: VISITOR_INFO1_LIVE=..."
+                  "Authorization: SAPISIDHASH 0_timestamp_hash\nCookie: SAPISID=...; __Secure-3PAPISID=...\nX-Goog-Visitor-Id: CgtnOElGVm1rX25FcyiNxZ3IBjIKCgJERRIEEgAgTQ=="
                 }
-                className="min-h-[160px] font-mono text-xs sm:text-sm"
+                className={`font-mono text-xs sm:text-sm transition-colors ${
+                  headersLocked
+                    ? "min-h-[112px] bg-muted text-muted-foreground"
+                    : "min-h-[160px]"
+                }`}
                 disabled={isFetching || isDeleting}
+                readOnly={headersLocked}
+                aria-readonly={headersLocked}
                 spellCheck={false}
                 autoCorrect="off"
                 autoCapitalize="none"
@@ -405,6 +576,11 @@ function App() {
                   </div>
                 </div>
               )}
+              {validationErrors.length > 0 && (
+                <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+                  {validationErrors.join(" ")}
+                </div>
+              )}
             </div>
 
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -419,25 +595,31 @@ function App() {
                       Loading playlists…
                     </span>
                   ) : (
-                    "Fetch playlists"
+                    "Refresh playlists"
                   )}
                 </Button>
+                {headersLocked && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleUnlockHeaders}
+                    disabled={isFetching || isDeleting}
+                  >
+                    Edit token
+                  </Button>
+                )}
                 <span className="text-sm text-muted-foreground">
-                  Mode:{" "}
+                  Status:{" "}
                   <span className="font-medium text-foreground">
-                    {usingOfficialApi
-                      ? "YouTube Data API v3"
-                      : usingInnerTube
-                        ? "YouTube internal API (youtubei)"
-                        : "waiting for headers"}
+                    {hasSapAuth ? "SAPISIDHASH ready" : "waiting for SAPISIDHASH token"}
                   </span>
                 </span>
               </div>
               <span className="text-xs text-muted-foreground sm:text-sm">
-                Authorization header:{" "}
+                Authentication:{" "}
                 <span
                   className={
-                    authHeader
+                    hasSapAuth
                       ? "font-medium text-foreground"
                       : "font-medium text-destructive"
                   }
@@ -494,19 +676,69 @@ function App() {
             </div>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="overflow-hidden rounded-md border">
-              <Table>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <Input
+                type="search"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                placeholder="Search playlists…"
+                aria-label="Search playlists"
+                className="w-full sm:max-w-xs"
+                disabled={isDeleting}
+              />
+              {hasSearch ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setSearchQuery("")}
+                  disabled={isDeleting}
+                  className="sm:w-auto"
+                >
+                  Clear
+                </Button>
+              ) : null}
+            </div>
+            <div className="rounded-md border">
+              <Table
+                wrapperClassName="max-h-[480px] overflow-auto"
+                className="min-w-full"
+              >
                 <TableHeader>
                   <TableRow>
                     <TableHead className="w-[40px]">
                       <Checkbox
-                        checked={allSelected}
-                        onCheckedChange={() => toggleSelectAll()}
+                        checked={selectAllState}
+                        onCheckedChange={toggleSelectAll}
                         aria-label="Select all playlists"
-                        disabled={playlists.length === 0 || isDeleting}
+                        disabled={processedPlaylists.length === 0 || isDeleting}
                       />
                     </TableHead>
-                    <TableHead>Title</TableHead>
+                    <TableHead
+                      aria-sort={
+                        sortDirection === "asc"
+                          ? "ascending"
+                          : sortDirection === "desc"
+                            ? "descending"
+                            : "none"
+                      }
+                    >
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        onClick={handleToggleSort}
+                        className="flex items-center gap-1 px-0 font-semibold"
+                        disabled={processedPlaylists.length === 0}
+                      >
+                        Title
+                        {sortDirection === "asc" ? (
+                          <ArrowUp className="h-4 w-4" />
+                        ) : sortDirection === "desc" ? (
+                          <ArrowDown className="h-4 w-4" />
+                        ) : (
+                          <ArrowUpDown className="h-4 w-4 text-muted-foreground" />
+                        )}
+                      </Button>
+                    </TableHead>
                     <TableHead className="hidden sm:table-cell">Videos</TableHead>
                     <TableHead className="hidden sm:table-cell">
                       Privacy
@@ -528,8 +760,19 @@ function App() {
                           : "No playlists loaded yet."}
                       </TableCell>
                     </TableRow>
+                  ) : processedPlaylists.length === 0 ? (
+                    <TableRow>
+                      <TableCell
+                        colSpan={5}
+                        className="h-24 text-center text-sm text-muted-foreground"
+                      >
+                        {hasSearch
+                          ? `No playlists match "${normalizedSearch}".`
+                          : "No playlists to display."}
+                      </TableCell>
+                    </TableRow>
                   ) : (
-                    playlists.map((playlist) => {
+                    processedPlaylists.map((playlist) => {
                       const isSelected = selectedIds.has(playlist.id)
                       return (
                         <TableRow
@@ -554,12 +797,9 @@ function App() {
                                   loading="lazy"
                                 />
                               ) : null}
-                              <div className="space-y-1">
+                              <div>
                                 <p className="font-medium leading-tight">
                                   {playlist.title}
-                                </p>
-                                <p className="text-xs text-muted-foreground">
-                                  {playlist.channelTitle || "Unknown channel"}
                                 </p>
                               </div>
                             </div>
